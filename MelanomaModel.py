@@ -188,7 +188,7 @@ class CellModel(torch.nn.Module):
         self.p = p
         self.t = t
     def sigmoid(self,x):
-        return 1/(1+torch.exp(-500*(x-0.05)))
+        return 1/(1+np.exp(-500*(x-0.05)))
     def vecToDict(self,vec):
         out = {}
         for i, elem in enumerate(self.param_names):
@@ -212,8 +212,8 @@ class CellModel(torch.nn.Module):
 
         dS = (p['r_S']*ERK**p['n_rS'])/(p['K_rS']**p['n_rS'] + ERK**p['n_rS'])*\
                 S*(1-((T)/(p['theta']))) - \
-                S*p['k_S']*(torch.abs(d_ERK)**p['n_kS'])/\
-                    (p['K_kS']**p['n_kS'] + torch.abs(d_ERK)**p['n_kS'])*\
+                S*p['k_S']*(np.abs(d_ERK)**p['n_kS'])/\
+                    (p['K_kS']**p['n_kS'] + np.abs(d_ERK)**p['n_kS'])*\
                     self.sigmoid(-d_ERK) - \
                 S*p['k_SD']*(d_MITF**p['n_kSD'])/\
                     (p['K_kSD']**p['n_kSD'] + d_MITF**p['n_kSD'])*\
@@ -230,8 +230,7 @@ class CellModel(torch.nn.Module):
                 S*p['k_SR']*(d_PI3K**p['n_kSR'])/\
                     (p['K_kSR']**p['n_kSR'] + d_PI3K**p['n_kSR'])*\
                     self.sigmoid(d_PI3K)
-        
-        return torch.stack([dS,dD,dR])
+        return np.stack([dS,dD,dR])
 
 def RandomizeCellParams(generator):
     params_prolif = ['r_S','r_R']
@@ -240,18 +239,18 @@ def RandomizeCellParams(generator):
     
     p = {}
     for elem in params_prolif:
-        p[elem] = torch.tensor(generator.uniform(low=0.10,high=0.50,size=(1,))[0],dtype=torch.float32)
+        p[elem] = generator.uniform(low=0.10,high=0.50,size=(1,))[0]
     
-    p['k_S']  = torch.tensor(generator.uniform(low=0.1,high=0.3,size=(1,))[0],dtype=torch.float32)
-    p['k_SD'] = torch.tensor(generator.uniform(low=0.01,high=0.05,size=(1,))[0],dtype=torch.float32)
-    p['k_SR'] = torch.tensor(generator.uniform(low=0.01,high=0.05,size=(1,))[0],dtype=torch.float32)
+    p['k_S']  = generator.uniform(low=0.1,high=0.3,size=(1,))[0]
+    p['k_SD'] = generator.uniform(low=0.01,high=0.05,size=(1,))[0]
+    p['k_SR'] = generator.uniform(low=0.01,high=0.05,size=(1,))[0]
     
     for elem in params_constants:
-        p[elem] = torch.tensor(generator.uniform(low=0.1,high=1.0,size=(1,))[0],dtype=torch.float32)
+        p[elem] = generator.uniform(low=0.1,high=1.0,size=(1,))[0]
     for elem in params_coop:
-        p[elem] = torch.tensor(generator.uniform(low=0.5,high=2.5,size=(1,))[0],dtype=torch.float32)
+        p[elem] = generator.uniform(low=0.5,high=2.5,size=(1,))[0]
         
-    p['theta'] = torch.tensor(1.0,dtype=torch.float32)
+    p['theta'] = 1.0
     
     return p
 
