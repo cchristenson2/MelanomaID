@@ -11,7 +11,7 @@ torch.manual_seed(1)
 method = 'Radau'
 
 model_idx = [0] #iRAS protein used in testing
-dt = 0.5
+dt = 0.1
 T_SOLVE = 60
 plot = True
 sparsity_enforce = True
@@ -48,6 +48,7 @@ print("AVAILABLE PROCESSOR:", device, '\n')
 print('Not optimized for running on GPU due to complex libraries')
 
 def addToDataset(X,DX,RAF,GF,X_new,DX_new,RAF_new,GF_new):
+    """Append a new experiment's states, derivatives, and inputs to the running dataset tensors."""
     X   = torch.cat((X,X_new.unsqueeze(0)),dim=0)
     DX  = torch.cat((DX,DX_new.unsqueeze(0)),dim=0)
     RAF = torch.cat((RAF,RAF_new.unsqueeze(0)),dim=0)
@@ -56,10 +57,18 @@ def addToDataset(X,DX,RAF,GF,X_new,DX_new,RAF_new,GF_new):
     return X,DX,RAF,GF
 
 def POOL_DATA(X,RAF,inputs):
+    """Build the candidate matrix by prepending a ones column (constant term) and
+    concatenating states, external inputs, and drug signals. Shape: (sets, T, 1+18+3+4)."""
     sets, n, _ = X.shape
     return torch.cat((torch.ones(sets,n,1),X,inputs,RAF),dim=2)
 
 def enforce_sparsity(W,model_idx):
+    """Zero out sparsity weights for source/decay terms that must always be present.
+
+    States in 'both' (inactive forms) require both a source (W[0]) and decay (W[1]) term.
+    Active states only require a decay (W[1]). Zeroing the weight prevents L1 from
+    removing these mandatory terms during training.
+    """
     #Enforces soft constraint on source and decay terms depending on the state
     both = [0,2,4,5,7,9,11,15]
     with torch.no_grad():
@@ -75,18 +84,41 @@ def enforce_sparsity(W,model_idx):
     return W
 
 def ZERO_COEFF(l,threshold):
+    """Hard-threshold: set any coefficient with |value| < threshold to exactly zero (in-place)."""
     with torch.no_grad():
         for elem in l:
             elem [torch.abs(elem) < threshold] = 0.0
     return l
 
 def boundVar(varlist,bounds):
+    """Clip all tensors in varlist to [bounds[0], bounds[1]] in-place. Used to keep
+    nonlinear Hill/MM constants in a physically meaningful range during training."""
     for elem in varlist:
         elem[elem < bounds[0]] = bounds[0]
         elem[elem > bounds[1]] = bounds[1]
     return varlist
 
 def getLibrary(state, analog, flip):
+    """Build the candidate function library for a given MAPK state.
+
+    Args:
+        state:  name of the target state (e.g. 'iRAS')
+        analog: name of the paired active/inactive counterpart (e.g. 'aRAS'), or None
+        flip:   if True, list analog terms before self terms (used for active states
+                so that inactivation terms appear first in the library)
+
+    Returns:
+        dict with keys: 'terms' (names), 'lin_idx', 'drug_idx', 'bilin_idx',
+        'mm2_idx', 'hill_idx', 'term_types', 'numbers', 'uses_self'
+
+    Term types:
+        0 = constant
+        1 = linear state term (decay/self)
+        2 = drug interaction (state * inhibitor)
+        3 = bilinear (state * other_state)
+        4 = Michaelis-Menten: substrate * enzyme / (K + substrate)
+        5 = Hill: enzyme / (K + enzyme)
+    """
     term_types = []
     numbers    = []
     uses_self  = []
@@ -254,26 +286,34 @@ def getLibrary(state, analog, flip):
             'numbers':numbers,'uses_self':uses_self}
 
 def flattenTorchList(x):
+    """Concatenate a list of 1-D tensors and flatten to a single 1-D tensor."""
     return torch.flatten(torch.cat(x))
-    
+
 class MM2_term(torch.nn.Module):
+    """Michaelis-Menten term: (substrate * enzyme) / (K + substrate).
+    K is a learnable saturation constant."""
     def __init__(self,K):
         super().__init__()
         self.K = K
-        
+
     def forward(self, x, y):
         return (x * y) / (self.K + x)
-    
+
 class Hill_term(torch.nn.Module):
+    """Hill-style saturation term: enzyme / (K + enzyme).
+    K is a learnable saturation constant."""
     def __init__(self,K):
         super().__init__()
         self.K = K
-        
+
     def forward(self, x):
         return x / (self.K + x)
 
-#Used for the candidate identfication from the library
+#Used for the candidate identification from the library
 class ADAM_SINDy_MODEL(torch.nn.Module):
+    """SINDy model used during ADAM optimization. Evaluates the full candidate library
+    with learnable coefficients (a) and nonlinear constants (K2 for MM, K3 for Hill),
+    then masks terms with biologically incorrect sign to enforce known constraints."""
     def __init__(self,a,K2,K3,library_package):
         super().__init__()
         self.a = a
@@ -323,6 +363,9 @@ class ADAM_SINDy_MODEL(torch.nn.Module):
 
 #Used for the permutation testing
 class ADAM_SINDy_MODEL_permute(torch.nn.Module):
+    """SINDy model used during AIC permutation search. Evaluates a specific subset
+    (permutation) of library terms with fixed, refitted coefficients and nonlinear
+    constants. Returns numpy output for use with scipy.optimize.least_squares."""
     def __init__(self,library_package,starts,dt,initial):
         super().__init__()
         self.lib = library_package
@@ -373,6 +416,9 @@ class ADAM_SINDy_MODEL_permute(torch.nn.Module):
         return temp
         
 def getParamNum(permutation, term_types):
+    """Count the total number of free parameters for a given term permutation.
+    Linear/bilinear/drug terms cost 1 parameter (coefficient only).
+    MM and Hill terms cost 2 (coefficient + saturation constant K)."""
     k = 0
     for elem in permutation:
         if (term_types[elem] == 0 or term_types[elem] == 1 or 
@@ -383,6 +429,10 @@ def getParamNum(permutation, term_types):
     return k
                   
 class TO_SOLVER():
+    """Callable wrapper for ADAM_SINDy_MODEL_permute, used as the residual function
+    for scipy.optimize.least_squares. Unpacks the flat parameter vector x into
+    linear coefficients, MM constants, and Hill constants, then returns residuals.
+    The .final() method returns the model output (not residuals) for a given x."""
     def __init__(self,model,data,candidates,permutation,term_types):
         self.model = model
         self.data  = data
@@ -447,7 +497,9 @@ class TO_SOLVER():
         return output
     
 ###############################################################################
-# Initialize model ############################################################    
+# Solve for steady state ######################################################
+# Run MAPKModel for T=200 with no drug to reach steady state from all-ones IC.
+# The final time point is used as the initial condition for all perturbation sims.
 T_temp = 200
 t_temp  = np.arange(0,T_temp+dt,dt)
 
@@ -464,6 +516,10 @@ steady_state = X_temp[-1,:]
 
 ###############################################################################
 # Build dataset ###############################################################
+# For each perturbation condition, simulate MAPKModel with Radau at high
+# resolution (dt=0.001), downsample to the analysis dt, and compute
+# time-derivatives via torch.gradient. Collects X, dX/dt, drug, and input
+# tensors across all experiments for use as SINDy training data.
 T = T_SOLVE
 t  = np.arange(0,T+dt,dt)
 t_eval  = np.arange(0,T+0.001,0.001) #High resolution time data to downsample for model fitting
@@ -509,6 +565,11 @@ A_CANDIDATES = A_CANDIDATES.to(torch.float32)
 
 # ###############################################################################
 # # Initialize ADAM_SINDy training ##############################################
+# Two Adam optimizers run in parallel:
+#   optim_COEFF_ADT: updates all coefficients and nonlinear constants (K values)
+#   optim_weights:   updates the L1 sparsity weights (promotes coefficient dropout)
+# Both use step-decay learning rate schedules. Nonlinear constants are clipped
+# to [0.05, 5.0] after each step via boundVar.
 Epochs              = 25000
 lr                  = 1e-2
 lr_sparsity         = 1e-3
@@ -596,7 +657,8 @@ for epoch in range(Epochs):
     loss_l2 = loss_function (dX_data, output_data)
     loss_l1 = torch.linalg.matrix_norm(torch.abs(WEIGHTS)*\
                                        flattenTorchList(coeff_list).unsqueeze(1),ord = 1)
-    loss_epoch = loss_l2 + loss_l1
+    loss_elas = 1e-6*torch.linalg.matrix_norm(flattenTorchList(coeff_list).unsqueeze(1),ord=2)
+    loss_epoch = loss_l2 + loss_l1 + loss_elas
                       
     optim_COEFF_ADT.zero_grad()
     optim_weights.zero_grad()
@@ -836,7 +898,7 @@ if plot == True:
                      plt.Line2D([0], [0], color='red', lw=4)]
     
     fig = plt.figure(figsize=(10,6),layout='constrained')
-    fig.suptitle(model_names[0])
+    fig.suptitle(model_names[0] + ' - Post ADAM-SINDy terms and fit')
     from matplotlib.gridspec import GridSpec
     gs = GridSpec(2,2)
     ax1 = fig.add_subplot(gs[0])
@@ -861,6 +923,12 @@ if plot == True:
     ax3.set_ylabel('Derivative')
     plt.show()
 
+###############################################################################
+# AIC permutation search ######################################################
+# Take the nonzero terms from ADAM-SINDy (excluding mandatory source/decay terms)
+# and enumerate all subsets (up to size 3). Each subset is refitted with
+# scipy.optimize.least_squares and scored by AIC. The permutation with the
+# lowest AIC is selected as the final sparse model.
 #Get permutations of terms based on ADAM-SINDy outputs
 nonzeros = eval('torch.nonzero(COEFF_'+model_names[0]+')')
 nonzeros = nonzeros.detach().numpy()
@@ -975,13 +1043,15 @@ print('Permutation search done')
     
 AIC_time = time.time() - t_start
 
-####Save results in dictionary
+####Save post-SINDy outputs before AIC search
 post_sindy_params = optimized_params
 post_sindy_out    = full_model.cpu().detach().numpy()
 
 def getTruePermutation(name):
+    """Return the ground-truth term indices for a given state name.
+    Used to compare ADAM-SINDy + AIC recovery against the known model structure."""
     if 'iRAS' in name:
-        return [[0,1,2,20,30],[0,1,20,30]]
+        return [0,1,20,30]
     elif 'aRAS' in name:
         return [1,19,29]
     elif 'iRAF_wt' in name:
@@ -991,11 +1061,11 @@ def getTruePermutation(name):
     elif 'RAF_m' in name:
         return [0,1,2]
     elif 'iMEK' in name:
-        return [[0,1,2,6,7,42],[0,1,6,7,42]]
+        return [0,1,6,7,42]
     elif 'aMEK' in name:
         return [1,5,6,41]
     elif 'iERK' in name:
-        return [[0,1,2,9,42],[0,1,9,42]]
+        return [0,1,9,42]
     elif 'aERK' in name:
         return [1,8,41]
     elif 'iPI3K' in name:
@@ -1018,27 +1088,63 @@ def getTruePermutation(name):
         return [1,10,38]       
 
 true_perm = getTruePermutation(model_names[0])  
+
+#Extract identified model through Tau thresholding
 ind = np.argmin(AIC)
-fit_permute = permutations[ind]
-best_params = params[ind]
-
-true_fit = torch.zeros((dX_data.shape)).to(device)
-for i, elem in enumerate(model_names):
-    true_fit[:,:,i] = eval(elem+'_MODEL_TRUE(A_CANDIDATES.to(torch.float32))')
-
-fit_tc = fits[ind]    
-for i in range(4):
-    plt.plot(mm.detachTorch(t),dX_data[i,:,0].detach().numpy(),color='blue',marker='o')
-    plt.plot(mm.detachTorch(t),fit_tc[i,:],color='red')
-    plt.show()
-
 sort_ind = np.argsort(AIC)
-sorted_perm = []
-sorted_params = []
+temp_mag = np.max(np.abs(mm.detachTorch(dX_data)))
+tau = 30*temp_mag
+
+sorted_perms = []
 sorted_aic = []
-for i in sort_ind:
-    sorted_perm.append(permutations[i])
-    sorted_params.append(params[i])
-    sorted_aic.append(AIC[i])
-sorted_aic = np.array(sorted_aic)
+for j in range(len(sort_ind)):
+    sorted_aic.append(AIC[sort_ind[j]])
+    sorted_perms.append(permutations[sort_ind[j]])
+
+cut = 0
+best_AIC = AIC[ind]
+for j in range(1,len(sort_ind)):
+    if np.abs(100*(sorted_aic[j] - best_AIC)/best_AIC) < tau:
+        cut = j
+    else:
+        break
     
+perms_out = []
+for j in range(cut+1):
+    perms_out.append(sorted_perms[j])
+    
+#count number of times a term appears
+temp_counts = np.zeros(len(lib['terms']))
+for j, elem1 in enumerate(perms_out):
+    for k, elem2 in enumerate(elem1):
+        temp_counts[elem2]+=1
+        
+max_counts = np.max(temp_counts)
+        
+fit_permute = np.argwhere(temp_counts==max_counts)
+if fit_permute.size > 1:
+    fit_permute = np.squeeze(fit_permute)
+else:
+    fit_permute = fit_permute[:,0]
+fit_permute = [fit_permute[j] for j in range(fit_permute.size)]  
+
+if set(fit_permute) == set(true_perm):
+    print('Model correctly identified')
+else:
+    print('Model incorrectly identified')
+
+###############################################################################
+# Print string representation of true and fit models ##########################
+term_names = lib['terms']
+
+true_terms = [term_names[i] for i in true_perm]
+fit_terms  = [term_names[i] for i in fit_permute]
+
+print('\n' + '='*60)
+print('State: ' + model_names[0])
+print('='*60)
+print('True model:')
+print('  d' + model_names[0] + '/dt = ' + ' + '.join(true_terms))
+print('\nFit model:')
+print('  d' + model_names[0] + '/dt = ' + ' + '.join(fit_terms))
+print('='*60 + '\n')

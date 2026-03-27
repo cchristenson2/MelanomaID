@@ -9,19 +9,29 @@ class MAPKModel(torch.nn.Module):
     ##### MEK, ERK, and RAS inhibitor in model were not tested #####
     ################################################################
     def __init__(self,drug,inputs,p,t):
+        """
+        Args:
+            drug:   (T x 4) array of inhibitor concentrations [RAF, MEK, ERK, RAS]
+            inputs: (T x 3) array of external signals [RTK, GPCR, PPTASE]
+            p:      dict of kinetic parameters (or vector, converted via vecToDict)
+            t:      time vector used for interpolating drug/input signals
+        """
         super().__init__()
         self.drug = drug.T
         self.inputs = inputs.T
         self.p = p
         self.t = t
     def vecToDict(self,vec):
+        """Convert a flat parameter vector to a named dict using self.param_names."""
         out = {}
         for i, elem in enumerate(self.param_names):
             out[elem] = vec[i]
         return out
     def forward(self, t, states):
+        """ODE right-hand side for the 18-state MAPK cascade. Compatible with
+        scipy.integrate.solve_ivp. Interpolates drug/input signals at time t."""
         p = self.p
-        
+
         iRAS, aRAS, iRAF_wt, aRAF_wt, RAF_m, iMEK, aMEK, iERK, aERK, \
         iPI3K, aPI3K, iAKT, aAKT, ATP, cAMP, iPKA, aPKA, MITF = states
 
@@ -134,13 +144,21 @@ class MAPKModel(torch.nn.Module):
                             d_MITF])
             
 def RandomizeMAPKParams(generator):
-    params_velocities = ['V_aRAS','V_iRAS','V_aRAF','V_iRAF','V_aMEK','V_iMEK',
-                         'V_aERK','V_iERK','V_aPI3K_RTK','V_iPI3K','V_aAKT',
-                         'V_iAKT','V_aPI3K_GPCR','V_acAMP','V_aPKA','V_iPKA']
-    params_constants = ['K_aRAS','K_iRAS','K_aRAF','K_iRAF','K_aMEK','K_aMEK_m',
-                        'K_iMEK','K_aERK','K_iERK','K_aPI3K_RTK','K_iPI3K',
-                        'K_aAKT','K_iAKT','K_aPI3K_GPCR','K_acAMP','K_aPKA',
-                        'K_iPKA','K_sMITF','K_sATP']
+    """Sample MAPK kinetic parameters uniformly from biologically motivated ranges.
+
+    Args:
+        generator: numpy.random.Generator instance (use a seeded rng for reproducibility)
+    Returns:
+        dict of parameter name → scalar value
+    """
+    params_velocities = ['V_aRAS','V_iRAS','V_aRAF','V_iRAF','V_aMEK',
+                        'V_iMEK','V_aERK','V_iERK','V_aPI3K_RTK',
+                        'V_aPI3K_RAS','V_iPI3K','V_aAKT','V_iAKT','V_aPI3K_GPCR',
+                        'V_acAMP','V_aPKA','V_iPKA']
+    params_constants = ['K_aRAS','K_iRAS','K_aRAF','K_iRAF','K_aMEK',
+                        'K_aMEK_m','K_iMEK','K_aERK','K_iERK','K_aPI3K_RTK',
+                        'K_aPI3K_RAS','K_iPI3K','K_aAKT','K_iAKT','K_aPI3K_GPCR',
+                        'K_acAMP','K_aPKA','K_iPKA','K_sMITF','K_sATP']
     params_sources = ['s_iRAS','s_iRAF_wt','s_RAF_m','s_iMEK','s_iERK',
                       's_iPI3K','s_iAKT','s_iPKA']
     params_deaths = ['mu_RTK','mu_iRAS','mu_aRAS','mu_iRAF_wt','mu_aRAF_wt',
@@ -182,57 +200,79 @@ def RandomizeMAPKParams(generator):
 
 class CellModel(torch.nn.Module):
     def __init__(self, initial, proteins, p, t):
+        """
+        Args:
+            initial:  steady-state protein values at t=0 (used to compute deviations)
+            proteins: (T x 18) array of MAPK protein time-series from MAPKModel
+            p:        dict of cell kinetic parameters (or vector, converted via vecToDict)
+            t:        time vector for interpolating protein signals
+        """
         super().__init__()
         self.initial = initial
         self.proteins = proteins
         self.p = p
         self.t = t
-    def sigmoid(self,x):
-        return 1/(1+np.exp(-500*(x-0.05)))
     def vecToDict(self,vec):
+        """Convert a flat parameter vector to a named dict using self.param_names."""
         out = {}
         for i, elem in enumerate(self.param_names):
             out[elem] = vec[i]
         return out
     def forward(self, t, states):
+        """ODE right-hand side for the 3-state cell phenotype model (S, D, R).
+
+        Transitions are driven by deviations of ERK, PI3K, and MITF from steady state.
+        Directional gating uses a Heaviside step function (hard threshold at zero).
+        Compatible with scipy.integrate.solve_ivp.
+        """
         p = self.p
-        
+
         S,D,R = states
         T = S+D+R
-        
+
         ERK  = np.interp(t,self.t,self.proteins[:,0])
         AKT  = np.interp(t,self.t,self.proteins[:,2])
-        
+
         d_ERK  = ERK - self.initial[0]
         d_PI3K = np.interp(t,self.t,self.proteins[:,1]) - self.initial[1]
         d_MITF = np.interp(t,self.t,self.proteins[:,3]) - self.initial[3]
-        
+
         if not isinstance(p,dict):
             p = self.vecToDict(p)
 
+        if -d_ERK <= 0:
+            ds_erk = 0
+        else:
+            ds_erk = S*p['k_S']*(np.abs(d_ERK)**p['n_kS'])/(p['K_kS']**p['n_kS'] + np.abs(d_ERK)**p['n_kS'])
+
+        if d_MITF <= 0:
+            d_mitf = 0
+        else:
+            d_mitf = S*p['k_SD']*(d_MITF**p['n_kSD'])/(p['K_kSD']**p['n_kSD'] + d_MITF**p['n_kSD'])
+
+        if d_PI3K <= 0:
+            d_pi3k = 0
+        else:
+            d_pi3k = S*p['k_SR']*(d_PI3K**p['n_kSR'])/(p['K_kSR']**p['n_kSR'] + d_PI3K**p['n_kSR'])
+
         dS = (p['r_S']*ERK**p['n_rS'])/(p['K_rS']**p['n_rS'] + ERK**p['n_rS'])*\
-                S*(1-((T)/(p['theta']))) - \
-                S*p['k_S']*(np.abs(d_ERK)**p['n_kS'])/\
-                    (p['K_kS']**p['n_kS'] + np.abs(d_ERK)**p['n_kS'])*\
-                    self.sigmoid(-d_ERK) - \
-                S*p['k_SD']*(d_MITF**p['n_kSD'])/\
-                    (p['K_kSD']**p['n_kSD'] + d_MITF**p['n_kSD'])*\
-                    self.sigmoid(d_MITF) - \
-                S*p['k_SR']*(d_PI3K**p['n_kSR'])/(p['K_kSR']**p['n_kSR'] + d_PI3K**p['n_kSR'])*\
-                self.sigmoid(d_PI3K)
-        
-        dD = S*p['k_SD']*(d_MITF**p['n_kSD'])/\
-                (p['K_kSD']**p['n_kSD'] + d_MITF**p['n_kSD'])*\
-                self.sigmoid(d_MITF)
-                
+                S*(1-((T)/(p['theta']))) - ds_erk - d_mitf - d_pi3k
+
+        dD = d_mitf
+
         dR = (p['r_R']*AKT**p['n_rR'])/(p['K_rR']**p['n_rR'] + AKT**p['n_rR'])*\
-                R*(1-((T)/(p['theta']))) + \
-                S*p['k_SR']*(d_PI3K**p['n_kSR'])/\
-                    (p['K_kSR']**p['n_kSR'] + d_PI3K**p['n_kSR'])*\
-                    self.sigmoid(d_PI3K)
+                R*(1-((T)/(p['theta']))) + d_pi3k
+
         return np.stack([dS,dD,dR])
 
 def RandomizeCellParams(generator):
+    """Sample cell phenotype parameters uniformly from biologically motivated ranges.
+
+    Args:
+        generator: numpy.random.Generator instance
+    Returns:
+        dict of parameter name → scalar value
+    """
     params_prolif = ['r_S','r_R']
     params_constants = ['K_rS','K_rR','K_kS','K_kSD','K_kSR']
     params_coop = ['n_rS','n_rR','n_kS','n_kSD','n_kSR']
@@ -248,7 +288,8 @@ def RandomizeCellParams(generator):
     for elem in params_constants:
         p[elem] = generator.uniform(low=0.1,high=1.0,size=(1,))[0]
     for elem in params_coop:
-        p[elem] = generator.uniform(low=0.5,high=2.5,size=(1,))[0]
+        # p[elem] = generator.uniform(low=0.5,high=2.5,size=(1,))[0]
+        p[elem] = torch.tensor(1.0,dtype=torch.float32)
         
     p['theta'] = 1.0
     
@@ -257,8 +298,16 @@ def RandomizeCellParams(generator):
 ###############################################################################
 # Plotting functions ##########################################################
 
-#Plot all time courses from the network model    
+#Plot all time courses from the network model
 def plotFullNetwork(t,X,compare = [],title=None):
+    """Plot all 18 MAPK state trajectories in a 3x6 grid.
+
+    Args:
+        t:       time vector
+        X:       (18 x T) state matrix
+        compare: optional second (18 x T) matrix overlaid in a different color
+        title:   optional figure title
+    """
     fig, axes = plt.subplots(3,6,layout='constrained',figsize=(18,9))
     Labels = ['iRAS', 'aRAS', 'iRAF_wt', 'aRAF_wt', 'RAF_m', 'iMEK',
               'aMEK', 'iERK', 'aERK','iPI3K', 'aPI3K', 'iAKT',
@@ -281,6 +330,13 @@ def plotFullNetwork(t,X,compare = [],title=None):
 
 #Plot all time courses from the cell model
 def plotCells(t,X,title=None):
+    """Plot S, D, R, and total cell count on a single axes.
+
+    Args:
+        t:     time vector
+        X:     (3 x T) cell state matrix [S, D, R]
+        title: optional figure title
+    """
     fig, ax = plt.subplots(1,1,layout='constrained',figsize=(15,6))
     Labels = ['S','D','R']
     for i in range(3):
@@ -298,6 +354,7 @@ def plotCells(t,X,title=None):
 ###############################################################################
 # Random ######################################################################   
 def detachTorch(x):
-    return x.cpu().detach().numpy()        
+    """Move a torch tensor to CPU and convert to a numpy array."""
+    return x.cpu().detach().numpy()
         
         

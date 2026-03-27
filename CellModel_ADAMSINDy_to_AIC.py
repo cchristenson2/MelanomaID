@@ -18,6 +18,7 @@ plot = True
 protein_indices = [8,10,12,17]
 
 def addToDataset(X,DX,P,X_new,DX_new,P_new):
+    """Append a new experiment's cell states, derivatives, and protein signals to the dataset."""
     X   = torch.cat((X,X_new.unsqueeze(0)),dim=0)
     DX  = torch.cat((DX,DX_new.unsqueeze(0)),dim=0)
     P = torch.cat((P,P_new.unsqueeze(0)),dim=0)
@@ -25,25 +26,45 @@ def addToDataset(X,DX,P,X_new,DX_new,P_new):
     return X,DX,P
 
 def POOL_DATA(X,P):
+    """Build the candidate matrix by prepending a ones column and concatenating
+    cell states and protein signals. Shape: (sets, T, 1+3+18)."""
     sets, n, _ = X.shape
     return torch.cat((torch.ones(sets,n,1),X,P),dim=2)
 
 def ZERO_COEFF(l,threshold):
+    """Hard-threshold: set any coefficient with |value| < threshold to exactly zero (in-place)."""
     with torch.no_grad():
         for elem in l:
             elem [torch.abs(elem) < threshold] = 0.0
     return l
 
 def boundVar(varlist,bounds):
+    """Clip all tensors in varlist to [bounds[0], bounds[1]] in-place. Used to keep
+    nonlinear Hill constants in a physically meaningful range during training."""
     for elem in varlist:
         elem[elem < bounds[0]] = bounds[0]
         elem[elem > bounds[1]] = bounds[1]
     return varlist
 
 def flattenTorchList(x):
+    """Concatenate a list of 1-D tensors and flatten to a single 1-D tensor."""
     return torch.flatten(torch.cat(x))
 
 def getLibrary(state):
+    """Build the candidate function library for a given cell state (S, D, or R).
+
+    Args:
+        state: 'S', 'D', or 'R'
+
+    Returns:
+        dict with keys: 'terms' (names), 'prolif_hill_idx', 'lin_hill_idx',
+        'term_types', 'numbers', 'self_propagate'
+
+    Term types:
+        0 = constant
+        1 = proliferation-Hill: state * (1 - T/theta) * Hill(protein)  [self-propagating]
+        2 = linear-Hill: S * Hill(|Δprotein|) * sigmoid(±Δprotein)     [transition term]
+    """
     term_types     = []
     numbers        = []
     self_propagate = []
@@ -109,22 +130,37 @@ def getLibrary(state):
             'self_propagate':self_propagate}
 
 class Hill_term(torch.nn.Module):
+    """Hill-style saturation term: x / (K + x). K is a learnable constant."""
     def __init__(self,K):
         super().__init__()
         self.K = K
-        
+
     def forward(self, x):
         return x / (self.K + x)
 
 class Log_term(torch.nn.Module):
+    """Logistic growth term: x * (1 - y/theta). Implements density-dependent
+    proliferation where y is total cell count and theta is the carrying capacity."""
     def __init__(self,theta):
         super().__init__()
         self.theta = theta
-        
+
     def forward(self, x, y):
         return x*(1 - (y/self.theta))
-    
+
 class ADAM_SINDy_MODEL(torch.nn.Module):
+    """SINDy model used during ADAM optimization. Evaluates the full candidate library
+    with learnable coefficients (a) and nonlinear constants (K1, theta, K2).
+    Masks terms with biologically incorrect sign to enforce known constraints.
+
+    Args:
+        a:               coefficient vector (learnable)
+        K1:              Hill saturation constants for proliferation terms (learnable)
+        theta:           carrying capacity for logistic growth terms (learnable)
+        K2:              Hill saturation constants for transition terms (learnable)
+        library_package: output of getLibrary for this state
+        steady_state:    protein steady-state values; deviations drive transitions
+    """
     def __init__(self,a,K1,theta,K2,library_package,steady_state):
         super().__init__()
         self.a  = a
@@ -140,22 +176,19 @@ class ADAM_SINDy_MODEL(torch.nn.Module):
         self.steady_state = steady_state
         
         self.sigmoid_sign = torch.tensor([-1.0,1.0,-1.0,1.0,-1.0,1.0,-1.0,1.0,
-                                          -1.0,-1.0,1.0,-1.0,1.0,1.0,1.0,-1.0,
+                                          -1.0,1.0,1.0,-1.0,1.0,1.0,1.0,-1.0,
                                           1.0,1.0])
-    
-    def sigmoid(self,x):
-        return 1/(1+torch.exp(-500*(x-0.05)))
     
     def forward(self, candidates):
         con  = candidates[:,:,0].unsqueeze(2)
         x    = candidates[:,:,1:4] #order: S, D, R - add T
         proteins = candidates[:,:,4:]
         d_proteins = proteins - self.steady_state
-        
+
         x = torch.cat((x, torch.sum(x,dim=2).unsqueeze(2)),dim=2)
-        
+
         terms = con
-        
+
         if isinstance(self.lib['prolif_hill_idx'],np.ndarray):
             temp_prolif  = self.prolif(x[:,:,self.lib['prolif_hill_idx'][:,0]],
                                       x[:,:,self.lib['prolif_hill_idx'][:,1]])
@@ -165,8 +198,9 @@ class ADAM_SINDy_MODEL(torch.nn.Module):
         if isinstance(self.lib['lin_hill_idx'],np.ndarray):
             temp_lin  = x[:,:,self.lib['lin_hill_idx'][:,0]]
             temp_hill = self.lin_hill(torch.abs(d_proteins[:,:,self.lib['lin_hill_idx'][:,1]]))
-            temp_sigmoid = self.sigmoid(self.sigmoid_sign*d_proteins[:,:,self.lib['lin_hill_idx'][:,1]])
-            lin_hill  = temp_lin * temp_hill * temp_sigmoid
+            temp_heaviside = self.sigmoid_sign*d_proteins[:,:,self.lib['lin_hill_idx'][:,1]]
+            temp_heaviside = (temp_heaviside > 0).float()
+            lin_hill  = temp_lin * temp_hill * temp_heaviside
             terms = torch.cat((terms, lin_hill),dim=2)   
         #Zero terms that correlate to biologically incorrect coefficients
         for i in range(terms.shape[2]):
@@ -179,6 +213,9 @@ class ADAM_SINDy_MODEL(torch.nn.Module):
         return terms @ self.a
 
 class ADAM_SINDy_MODEL_permute(torch.nn.Module):
+    """SINDy model used during AIC permutation search. Evaluates a specific subset
+    (permutation) of library terms with fixed, refitted coefficients and nonlinear
+    constants. Returns numpy output for use with scipy.optimize.least_squares."""
     def __init__(self,library_package,steady_state):
         super().__init__()
         
@@ -186,11 +223,8 @@ class ADAM_SINDy_MODEL_permute(torch.nn.Module):
         self.steady_state = steady_state
         
         self.sigmoid_sign = torch.tensor([-1.0,1.0,-1.0,1.0,-1.0,1.0,-1.0,1.0,
-                                          -1.0,-1.0,1.0,-1.0,1.0,1.0,1.0,-1.0,
+                                          -1.0,1.0,1.0,-1.0,1.0,1.0,1.0,-1.0,
                                           1.0,1.0],dtype=torch.float64)
-    
-    def sigmoid(self,x):
-        return 1/(1+torch.exp(-500*(x-0.05)))
     
     def forward(self, candidates, permutation, coeff, prolif_hill_k,
                 prolif_hill_cc, lin_hill_k):
@@ -198,44 +232,45 @@ class ADAM_SINDy_MODEL_permute(torch.nn.Module):
         x    = candidates[:,:,1:4] #order: S, D, R - add T
         proteins = candidates[:,:,4:]
         d_proteins = proteins - self.steady_state
-        
+
         x = torch.cat((x, torch.sum(x,dim=2).unsqueeze(2)),dim=2)
-        
+
         types   = self.lib['term_types']
         numbers = self.lib['numbers']
-        
+
         if permutation[0] == 0:
             terms = con
             start = 1
         else:
             start = 0
             terms = torch.empty((con.shape[0],con.shape[1],0),device=device)
-        
+
         prolif_hill_ind = 0
         lin_hill_ind    = 0
-        
+
         for elem in permutation[start:]:
             curr_type = types[elem]
             ind       = numbers[elem]
             if curr_type == 1:
                 term_prolif = Log_term(prolif_hill_cc)
                 term_hill   = Hill_term(prolif_hill_k[prolif_hill_ind])
-                
+
                 temp_prolif  = term_prolif(x[:,:,self.lib['prolif_hill_idx'][ind,0]],
                                           x[:,:,self.lib['prolif_hill_idx'][ind,1]])
                 temp_hill    = term_hill(proteins[:,:,self.lib['prolif_hill_idx'][ind,2]])
                 prolif_hill = (temp_prolif * temp_hill).unsqueeze(2)
                 terms = torch.cat((terms, prolif_hill),dim=2)
                 prolif_hill_ind += 1
-                
+
             elif curr_type == 2:
                 term_hill = Hill_term(lin_hill_k[lin_hill_ind])
-                
+
                 temp_lin  = x[:,:,self.lib['lin_hill_idx'][ind,0]]
                 temp_hill = term_hill(torch.abs(d_proteins[:,:,self.lib['lin_hill_idx'][ind,1]]))
-                temp_sigmoid = self.sigmoid(self.sigmoid_sign[self.lib['lin_hill_idx'][ind,1]]*\
-                                            d_proteins[:,:,self.lib['lin_hill_idx'][ind,1]])
-                lin_hill  = (temp_lin * temp_hill * temp_sigmoid).unsqueeze(2)
+                temp_heaviside = self.sigmoid_sign[self.lib['lin_hill_idx'][ind,1]]*\
+                                     d_proteins[:,:,self.lib['lin_hill_idx'][ind,1]]
+                temp_heaviside = (temp_heaviside > 0).double()
+                lin_hill  = (temp_lin * temp_hill * temp_heaviside).unsqueeze(2)
                 terms = torch.cat((terms, lin_hill),dim=2)
                 lin_hill_ind += 1
         
@@ -243,6 +278,9 @@ class ADAM_SINDy_MODEL_permute(torch.nn.Module):
         return dx.cpu().detach().numpy()
     
 def getParamNum(permutation, term_types):
+    """Count the total number of free parameters for a given term permutation.
+    Constant terms cost 1. Proliferation-Hill (type 1) and linear-Hill (type 2)
+    terms each cost 2 (coefficient + saturation constant K)."""
     k = 0
     for elem in permutation:
         if term_types[elem] == 0:
@@ -254,6 +292,10 @@ def getParamNum(permutation, term_types):
     return k
 
 class TO_SOLVER():
+    """Callable wrapper for ADAM_SINDy_MODEL_permute, used as the residual function
+    for scipy.optimize.least_squares. Unpacks the flat parameter vector x into
+    linear coefficients, proliferation-Hill constants, and linear-Hill constants,
+    then returns residuals. The .final() method returns the model output (not residuals)."""
     def __init__(self,model,data,candidates,permutation,term_types):
         self.model = model
         self.data  = data
@@ -322,6 +364,25 @@ class TO_SOLVER():
         output = self.model(self.candidates,self.permutation,coeff,
                             prolif_hill_k,1.0,lin_hill_k)
         return output
+
+def isin_tolerance(A, B, tol):
+    A = np.asarray(A)
+    B = np.asarray(B)
+
+    Bs = np.sort(B) # skip if already sorted
+    idx = np.searchsorted(Bs, A)
+
+    linvalid_mask = idx==len(B)
+    idx[linvalid_mask] = len(B)-1
+    lval = Bs[idx] - A
+    lval[linvalid_mask] *=-1
+
+    rinvalid_mask = idx==0
+    idx1 = idx-1
+    idx1[rinvalid_mask] = 0
+    rval = A - Bs[idx1]
+    rval[rinvalid_mask] *=-1
+    return np.minimum(lval, rval) <= tol
     
 generator   = np.random.default_rng(seed=1)
 net_params  = mm.RandomizeMAPKParams(generator)
@@ -329,10 +390,13 @@ cell_params = mm.RandomizeCellParams(generator)
 
 device = torch.device('cpu')
 print("AVAILABLE PROCESSOR:", device, '\n')
-print('Not optimized for running on GPU due to complex libraries')
+print('Note: GPU is supported but may run slower due to complex candidate libraries')
 ###############################################################################
-# Initialize network model ####################################################
-T_temp = 200
+# Solve for MAPK steady state #################################################
+# Run MAPKModel for T=200 with no drug to reach steady state from all-ones IC.
+# Steady-state protein values are used as initial conditions for perturbation sims
+# and as the reference point for computing protein deviations in CellModel.
+T_temp = 100
 t_temp  = np.arange(0,T_temp+dt,dt)
     
 initial = np.ones(18,)
@@ -346,6 +410,10 @@ steady_state = X_temp[-1,:]
 
 ###############################################################################
 # Build dataset ###############################################################
+# For each perturbation: simulate MAPKModel at high resolution (dt=0.001) to
+# get protein trajectories P, then simulate CellModel driven by P. Downsample
+# both to the analysis dt, compute dX/dt via torch.gradient, and collect into
+# tensors X_data (cells), P_data (proteins), dX_data (derivatives).
 T = T_SOLVE
 t  = torch.arange(0,T+dt,dt)
 t_eval  = np.arange(0,T+0.001,0.001) #High resolution time data to downsample for model fitting
@@ -369,26 +437,35 @@ for i, curr in enumerate(perturbations):
     
     Network = mm.MAPKModel(inhib, inputs, net_params, t)
     
-    P = scp.integrate.solve_ivp(Network, (0,T), steady_state, t_eval = t_eval,
-                                method=method, rtol=10**(-12),
-                                atol=10**(-12)*np.ones_like(steady_state)).y.T
-    Cell_model = mm.CellModel(steady_state[protein_indices], P[:,protein_indices],
-                              cell_params, t_eval)
-    X = scp.integrate.solve_ivp(Cell_model, (0,T), initial_cells, t_eval = t_eval,
-                                method=method, rtol=10**(-12),
-                                atol=10**(-12)*np.ones_like(initial_cells)).y.T
+    t_eval = np.arange(0,T+0.001,0.001)
+    meas_indices = isin_tolerance(np.round(t_eval,decimals=4),np.round(t,decimals=4), 1e-5)
     
-    meas_indices = np.isin(np.round(t_eval,decimals=3),np.round(t,decimals=3))
+    inhib, inputs = curr
+    
+    Network = mm.MAPKModel(inhib, inputs, net_params, t)
+    P = scp.integrate.solve_ivp(Network, (0,T), steady_state, t_eval = t_eval,
+                                method='Radau', rtol=10**(-12),
+                                atol=10**(-12)*np.ones_like(steady_state)).y.T
     P = P[meas_indices,:]
+    
+    t_eval = np.arange(0,T+0.001,0.001)
+    meas_indices = isin_tolerance(np.round(t_eval,decimals=4),np.round(t,decimals=4), 1e-5)
+    
+    CellModel = mm.CellModel(steady_state[protein_indices], P[:,protein_indices], cell_params, t)
+    out = scp.integrate.solve_ivp(CellModel, (0,T), initial_cells, t_eval = t_eval,
+                                method='Radau', rtol=10**(-12),
+                                atol=10**(-12)*np.ones_like(initial_cells))
+    X = out.y.T
     X = X[meas_indices,:]
     
     X = torch.tensor(X,dtype=torch.float32)
     P = torch.tensor(P,dtype=torch.float32)
+    
     if plot == True:
-        mm.plotFullNetwork(mm.detachTorch(torch.tensor(t)), mm.detachTorch(X).T,
+        mm.plotFullNetwork(mm.detachTorch(torch.tensor(t)), mm.detachTorch(P).T,
                            title='Protein Dataset '+str(i+1))
         
-        mm.plotCells(mm.detachTorch(torch.tensor(t)), mm.detachTorch(P).T,
+        mm.plotCells(mm.detachTorch(torch.tensor(t)), mm.detachTorch(X).T,
                            title='Cell Dataset '+str(i+1))
         
     dX_dt = torch.gradient(X, spacing = dt, dim = 0)[0]
@@ -406,13 +483,18 @@ A_CANDIDATES = POOL_DATA(X_data, P_data).to(device)
 
 ###############################################################################
 # Initialize ADAM_SINDy training ##############################################
+# Two Adam optimizers run in parallel:
+#   optim_COEFF_ADT: updates all coefficients and nonlinear constants (K values)
+#   optim_weights:   updates the L1 sparsity weights (promotes coefficient dropout)
+# Both use step-decay learning rate schedules. Nonlinear constants are clipped
+# to [0.05, 5.0] after each step via boundVar.
 Epochs              = 25000
 lr                  = 1e-2
 lr_sparsity         = 1e-3
 step_epoch          = 5000
 step_epoch_sparsity = 5000
 decay_rate          = 0.50
-tolerance           = 1e-6
+tolerance           = 1e-4
 
 all_model_names  = ['S','D','R']
 model_names  = [all_model_names[i]  for i in model_idx]
@@ -451,8 +533,7 @@ for i, elem in enumerate(model_names):
              PROLIF_HILL_CC_'+elem+',\
              LIN_HILL_K_'+elem+',temp,torch.tensor(steady_state,dtype=torch.float32))')
         
-WEIGHTS  = torch.nn.Parameter(1e-1*torch.ones((flattenTorchList(coeff_list).numel(),1)), requires_grad= True)
-torch.nn.init.normal_(WEIGHTS, mean=0, std=1e-1)
+WEIGHTS  = torch.nn.Parameter(1e-3*torch.ones((flattenTorchList(coeff_list).numel(),1)), requires_grad= True)
 optim_COEFF_ADT = torch.optim.Adam(optimized_params, lr=lr, betas = (0.9,0.99),
                                    eps = 10**-15)
 optim_weights   = torch.optim.Adam([WEIGHTS], lr=lr_sparsity, betas = (0.9,0.99),
@@ -485,7 +566,8 @@ for epoch in range(Epochs):
     loss_l2 = loss_function (dX_data, output_data)     
     loss_l1 = torch.linalg.matrix_norm(torch.abs(WEIGHTS)*\
                                        flattenTorchList(coeff_list).unsqueeze(1),ord = 1)
-    loss_epoch = loss_l2 + mag*loss_l1
+    loss_elas = 1e-6*torch.linalg.matrix_norm(flattenTorchList(coeff_list).unsqueeze(1),ord=2)
+    loss_epoch = loss_l2 + mag*loss_l1 + loss_elas
                       
     optim_COEFF_ADT.zero_grad()
     optim_weights.zero_grad()
@@ -510,7 +592,7 @@ for epoch in range(Epochs):
     scheduler_weights.step()
     
 SINDY_time = time.time() - t_start
-coeff_list = ZERO_COEFF(coeff_list,1e-3)
+coeff_list = ZERO_COEFF(coeff_list,5e-3)
 
 if plot == True:
     #Plot ADAM-SINDy loss figure to ensure convergence and movement
@@ -609,7 +691,7 @@ if plot == True:
                      plt.Line2D([0], [0], color='red', lw=4)]
     
     fig = plt.figure(figsize=(10,6),layout='constrained')
-    fig.suptitle(model_names[0])
+    fig.suptitle(model_names[0] + ' - Post ADAM-SINDy terms and fit')
     from matplotlib.gridspec import GridSpec
     gs = GridSpec(2,2)
     ax1 = fig.add_subplot(gs[0])
@@ -634,6 +716,11 @@ if plot == True:
     ax3.set_ylabel('Derivative')
     plt.show()
 
+###############################################################################
+# AIC permutation search ######################################################
+# Take the nonzero terms from ADAM-SINDy and enumerate all subsets (up to size 4).
+# Each subset is refitted with scipy.optimize.least_squares and scored by AIC.
+# The permutation with the lowest AIC is selected as the final sparse model.
 #Get permutations of terms based on ADAM-SINDy outputs
 nonzeros = eval('torch.nonzero(COEFF_'+model_names[0]+')')
 nonzeros = nonzeros.detach().numpy()
@@ -712,6 +799,8 @@ print('Permutation search done')
 AIC_time = time.time() - t_start
 
 def getTruePermutation(name):
+    """Return the ground-truth term indices for a given cell state.
+    Used to compare ADAM-SINDy + AIC recovery against the known model structure."""
     if 'S' in name:
         return [9,27,29,36]
     elif 'D' in name:
@@ -719,7 +808,65 @@ def getTruePermutation(name):
     elif 'R' in name:
         return [13,29]
 
+
 true_perm = getTruePermutation(model_names[0])  
+
+#Extract identified model through Tau thresholding
 ind = np.argmin(AIC)
-fit_permute = permutations[ind]
-best_params = params[ind]
+sort_ind = np.argsort(AIC)
+temp_mag = np.max(np.abs(mm.detachTorch(dX_data)))
+tau = 30*temp_mag
+
+sorted_perms = []
+sorted_aic = []
+for j in range(len(sort_ind)):
+    sorted_aic.append(AIC[sort_ind[j]])
+    sorted_perms.append(permutations[sort_ind[j]])
+
+cut = 0
+best_AIC = AIC[ind]
+for j in range(1,len(sort_ind)):
+    if np.abs(100*(sorted_aic[j] - best_AIC)/best_AIC) < tau:
+        cut = j
+    else:
+        break
+    
+perms_out = []
+for j in range(cut+1):
+    perms_out.append(sorted_perms[j])
+    
+#count number of times a term appears
+temp_counts = np.zeros(len(lib['terms']))
+for j, elem1 in enumerate(perms_out):
+    for k, elem2 in enumerate(elem1):
+        temp_counts[elem2]+=1
+        
+max_counts = np.max(temp_counts)
+        
+fit_permute = np.argwhere(temp_counts==max_counts)
+if fit_permute.size > 1:
+    fit_permute = np.squeeze(fit_permute)
+else:
+    fit_permute = fit_permute[:,0]
+fit_permute = [fit_permute[j] for j in range(fit_permute.size)]  
+
+if set(fit_permute) == set(true_perm):
+    print('Model correctly identified')
+else:
+    print('Model incorrectly identified')
+
+###############################################################################
+# Print string representation of true and fit models ##########################
+term_names = lib['terms']
+
+true_terms = [term_names[i] for i in true_perm]
+fit_terms  = [term_names[i] for i in fit_permute]
+
+print('\n' + '='*60)
+print('State: ' + model_names[0])
+print('='*60)
+print('True model:')
+print('  d' + model_names[0] + '/dt = ' + ' + '.join(true_terms))
+print('\nFit model:')
+print('  d' + model_names[0] + '/dt = ' + ' + '.join(fit_terms))
+print('='*60 + '\n')
