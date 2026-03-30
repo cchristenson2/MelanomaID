@@ -1,5 +1,6 @@
 # System Identification for Quantitative Systems Pharmacology models
 Title: Data-Driven System Identification in Cancer Systems Biology: A Multiscale Modeling Approach to Melanoma
+
 Authors: Chase Christenson, Siva Viknesh, Robert L. Judson-Torres, Amirhossein Arzani
 
 Self-contained scripts for the manuscript. These implement ADAM-SINDy with AIC-based model selection to identify sparse ODE models for a multiscale melanoma signaling model.
